@@ -1,8 +1,13 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List
+from typing import List, Set
 import json
+import logging
+
+# 設定日誌
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -11,8 +16,9 @@ class TrafficData(BaseModel):
     location: str
     event: str
 
-# 全域變數，儲存交通資料
-traffic_db = []
+# 全域變數，儲存交通資料和活躍的 WebSocket 連線
+traffic_db: List[TrafficData] = []
+active_connections: Set[WebSocket] = set()
 
 # 讀取 JSON 檔案
 def load_traffic_data():
@@ -20,7 +26,15 @@ def load_traffic_data():
     try:
         with open("traffic_data.json", "r", encoding="utf-8") as file:
             traffic_db = [TrafficData(**item) for item in json.load(file)]
+        logger.info("Successfully loaded traffic_data.json")
     except FileNotFoundError:
+        traffic_db = [
+            TrafficData(location="台北市中正區", event="交通順暢"),
+            TrafficData(location="新北市板橋區", event="輕微塞車")
+        ]
+        logger.warning("traffic_data.json not found, using default data")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}")
         traffic_db = [
             TrafficData(location="台北市中正區", event="交通順暢"),
             TrafficData(location="新北市板橋區", event="輕微塞車")
@@ -94,6 +108,7 @@ html = """
         async function fetchTrafficData() {
             try {
                 const response = await fetch('http://localhost:8000/traffic');
+                if (!response.ok) throw new Error('Failed to fetch traffic data');
                 const data = await response.json();
                 const tableBody = document.getElementById('traffic-data');
                 tableBody.innerHTML = '';
@@ -116,13 +131,17 @@ html = """
             console.log('WebSocket connected');
         };
         ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            const updateDiv = document.getElementById('realtime-update');
-            updateDiv.innerHTML = `
-                <strong>最新更新</strong><br>
-                地點: ${data.location}<br>
-                事件: ${data.event}
-            `;
+            try {
+                const data = JSON.parse(event.data);
+                const updateDiv = document.getElementById('realtime-update');
+                updateDiv.innerHTML = `
+                    <strong>最新更新</strong><br>
+                    地點: ${data.location}<br>
+                    事件: ${data.event}
+                `;
+            } catch (error) {
+                console.error('Error parsing WebSocket message:', error);
+            }
         };
         ws.onclose = () => {
             console.log('WebSocket disconnected');
@@ -141,25 +160,48 @@ html = """
 # REST API 端點：返回所有交通資料
 @app.get("/traffic", response_model=List[TrafficData])
 async def get_traffic():
+    logger.info("Fetching traffic data via /traffic")
     return traffic_db
 
-# WebSocket 端點：連線時推送一次預設記錄
+# WebSocket 端點：連線時推送一次預設記錄，並廣播接收到的訊息
 @app.websocket("/ws/traffic")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    active_connections.add(websocket)
+    logger.info("New WebSocket connection established")
     try:
         # 推送第一筆記錄
         if traffic_db:
             await websocket.send_json(traffic_db[0].dict())
-        # 保持連線，等待外部觸發（如 update_websocket.py）
+            logger.info(f"Sent initial record: {traffic_db[0].dict()}")
+        # 等待並廣播訊息
         while True:
-            await websocket.receive_text()  # 等待訊息，避免連線斷開
+            try:
+                data = await websocket.receive_json()
+                logger.info(f"Received message: {data}")
+                # 將接收到的訊息廣播給所有連線的客戶端
+                for connection in active_connections.copy():
+                    try:
+                        await connection.send_json(data)
+                        logger.info(f"Broadcasted message to connection: {data}")
+                    except Exception as e:
+                        logger.error(f"Error sending to connection: {e}")
+                        active_connections.remove(connection)
+            except Exception as e:
+                logger.error(f"WebSocket receive error: {e}")
+                break
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}")
     finally:
-        await websocket.close()
+        active_connections.remove(websocket)
+        try:
+            await websocket.close()
+            logger.info("WebSocket connection closed")
+        except RuntimeError as e:
+            logger.warning(f"Ignoring RuntimeError on close: {e}")
 
 # 提供前端頁面
 @app.get("/")
-async def get():
+async def get_root():
+    logger.info("Serving HTML page at /")
     return HTMLResponse(html)

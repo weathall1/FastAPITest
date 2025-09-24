@@ -27,6 +27,7 @@ async def update_websocket():
         async with websockets.connect("ws://localhost:8000/ws/traffic") as websocket:
             if data:
                 await websocket.send(json.dumps(data[0].dict()))
-                await websocket.recv()  # 等待伺服器回應，避免立即斷線
+                # 等待短暫時間，確保伺服器處理訊息
+                await asyncio.sleep(1)
     except Exception as e:
         print(f"WebSocket connection error: {e}")
